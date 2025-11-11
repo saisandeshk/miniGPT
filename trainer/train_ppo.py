@@ -1,6 +1,8 @@
 import os
 import sys
+from typing import cast 
 
+# Package path manipulation to ensure proper imports from parent directory
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -20,37 +22,98 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoModel
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import RLAIFDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model
+from trainer.trainer_utils import (
+    Logger, is_main_process, lm_checkpoint, init_distributed_mode, 
+    setup_seed, SkipBatchSampler, init_model
+)
 
+# Suppress all warnings for cleaner output
 warnings.filterwarnings('ignore')
 
 
-# 自定义的Critic模型，继承自MiniMindLM
 class CriticModel(MiniMindForCausalLM):
-    def __init__(self, params):
+    """
+    Custom Critic model for PPO value function estimation.
+    
+    This model inherits from MiniMindForCausalLM but replaces the language modeling
+    head with a value head that outputs a scalar value estimate for each token.
+    The critic provides state value estimates used for advantage computation in PPO.
+    
+    Architecture:
+        - Base: MiniMind transformer for encoding sequences
+        - Head: Single linear layer (hidden_size -> 1) for value prediction
+    """
+    def __init__(self, params: MiniMindConfig):
         super().__init__(params)
-        # 替换lm_head为输出单一价值的线性层
+        # Replace lm_head with a value head that outputs scalar value estimates
         self.value_head = nn.Linear(params.hidden_size, 1)
 
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
-        # 使用基础模型获取隐藏状态
+    def forward(self, input_ids=None, attention_mask=None, **kwargs): # NOTE: Check this! #type: ignore 
+        """
+        Forward pass to compute state values.
+        
+        Args:
+            input_ids: Token indices [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            
+        Returns:
+            values: Scalar value estimates [batch_size, seq_len]
+        """
+        # Get hidden states from base model
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         hidden_states = self.model.norm(outputs[0])
-        # 使用value_head获取价值估计
+        
+        # Compute values using value head
         values = self.value_head(hidden_states).squeeze(-1)
         return values
 
 
-def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
-    """整合所有奖励函数计算总奖励"""
-    def reasoning_model_reward(rewards):
-        # 1. 格式奖励（仅针对训练推理模型时使用）
+def calculate_rewards(
+    prompts: list[str], 
+    responses: list[str], 
+    reward_model, 
+    reward_tokenizer
+) -> torch.Tensor:
+    """
+    Compute comprehensive reward scores for generated responses.
+    
+    This function integrates multiple reward signals for RL training:
+    1. **Format Rewards**: For reasoning models, validates `<think>...</think><answer>...</answer>` structure
+    2. **Tag Counting Rewards**: Ensures proper usage of reasoning tags
+    3. **Reward Model Scores**: Uses external reward model to evaluate response quality
+    
+    Args:
+        prompts: List of input prompts (batch_size)
+        responses: List of generated responses (batch_size)
+        reward_model: External reward model for scoring response quality
+        reward_tokenizer: Tokenizer for the reward model
+        
+    Returns:
+        Tensor of reward scores of shape (batch_size,)
+    
+    Reward Calculation:
+        - Format reward: 0.5 for correct structure, 0.0 otherwise
+        - Tag counting: 0.25 per correctly used tag (max 1.0)
+        - Reward model: Scores clipped to [-scale, scale] range
+        - For reasoning models: Combines full response (40%) and answer content (60%)
+    """
+    def reasoning_model_reward(rewards: torch.Tensor) -> torch.Tensor:
+        """
+        Compute format-based rewards for reasoning model responses.
+        
+        Validates strict `<think>...</think><answer>...</answer>` format and counts
+        correct tag usage to prevent sparse rewards during training.
+        """
+        # Pattern 1: Exact format without extra newlines
         pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
+        # Pattern 2: Format with extra newline between sections
         pattern2 = r"^<think>\n.*?\n</think>\n\n<answer>\n.*?\n</answer>$"
-
+        
+        # Check response format
         matches_pattern = [re.match(pattern, response, re.S) for response in responses]
         matches_pattern2 = [re.match(pattern2, response, re.S) for response in responses]
 
+        # Assign format rewards
         format_rewards = []
         for match_pattern, match_pattern2 in zip(matches_pattern, matches_pattern2):
             if match_pattern:
@@ -61,134 +124,245 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
                 format_rewards.append(0.0)
         rewards += torch.tensor(format_rewards, device=args.device)
 
-        # 2. 标记奖励（防止严格奖励稀疏，仅针对训练推理模型时使用）
-        def mark_num(text):
+        def mark_num(text: str) -> float:
+            """Count correctly used reasoning tags (0.25 reward per tag)."""
             reward = 0
-            if text.count("<think>") == 1:
-                reward += 0.25
-            if text.count("</think>") == 1:
-                reward += 0.25
-            if text.count("<answer>") == 1:
-                reward += 0.25
-            if text.count("</answer>") == 1:
-                reward += 0.25
+            if text.count("<think>") == 1: reward += 0.25
+            if text.count("</think>") == 1: reward += 0.25
+            if text.count("<answer>") == 1: reward += 0.25
+            if text.count("</answer>") == 1: reward += 0.25
             return reward
 
+        # Count tag usage rewards
         mark_rewards = [mark_num(response) for response in responses]
         rewards += torch.tensor(mark_rewards, device=args.device)
         return rewards
 
+    # Initialize rewards tensor
     rewards = torch.zeros(len(responses), device=args.device)
 
-    # 格式奖励
+    # Apply reasoning-specific rewards if in reasoning mode
     if args.reasoning == 1:
         rewards = reasoning_model_reward(rewards)
 
-    # 使用reward model计算整个response的奖励
+    # Compute reward model scores
     with torch.no_grad():
         reward_model_scores = []
         for prompt, response in zip(prompts, responses):
-            pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
+            # Parse prompt into role-based message format
+            pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_im_end\|>"
             matches = re.findall(pattern, prompt, re.DOTALL)
             messages = [{"role": role, "content": content.strip()} for role, content in matches]
 
+            # Score the full response
             tmp_chat = messages + [{"role": "assistant", "content": response}]
             score = reward_model.get_score(reward_tokenizer, tmp_chat)
 
+            # Clip score to prevent extreme values
             scale = 3.0
             score = max(min(score, scale), -scale)
 
-            # 当args.reasoning=1时，额外计算<answer>内容的奖励
+            # For reasoning models: also score extracted answer content
             if args.reasoning == 1:
                 answer_match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
                 if answer_match:
                     answer_content = answer_match.group(1).strip()
-                    # 对answer内容单独计算reward
+                    # Score answer content separately
                     tmp_chat = messages + [{"role": "assistant", "content": answer_content}]
                     answer_score = reward_model.get_score(reward_tokenizer, tmp_chat)
                     answer_score = max(min(answer_score, scale), -scale)
+                    # Combine scores: 40% full response, 60% answer content
                     score = score * 0.4 + answer_score * 0.6
             reward_model_scores.append(score)
 
+        # Convert to tensor and add to rewards
         reward_model_scores = torch.tensor(reward_model_scores, device=args.device)
         rewards += reward_model_scores
 
     return rewards
 
 
-def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, start_step=0, wandb=None):
+def ppo_train_epoch(
+    epoch: int,
+    loader: DataLoader,
+    iters: int,
+    old_actor_model: MiniMindForCausalLM,
+    ref_model: MiniMindForCausalLM,
+    actor_scheduler,
+    critic_scheduler,
+    reward_model,
+    reward_tokenizer,
+    start_step: int = 0,
+    wandb=None
+) -> None:
+    """
+    Train models for one epoch using Proximal Policy Optimization (PPO).
+    
+    PPO is a state-of-the-art reinforcement learning algorithm for language model alignment.
+    It uses an actor-critic architecture with:
+    - Actor model: Generates responses (policy)
+    - Critic model: Estimates state values
+    - Old actor: For importance sampling ratio computation
+    - Reference model: For KL penalty to prevent policy collapse
+    
+    Args:
+        epoch: Current epoch number (0-indexed)
+        loader: DataLoader providing RL training data
+        iters: Total iterations in this epoch
+        old_actor_model: Snapshot of actor for policy ratio computation
+        ref_model: Frozen reference model for KL penalty
+        actor_scheduler: Learning rate scheduler for actor
+        critic_scheduler: Learning rate scheduler for critic
+        reward_model: External reward model for scoring responses
+        reward_tokenizer: Tokenizer for reward model
+        start_step: Starting step if resuming
+        wandb: Experiment tracking logger
+    
+    PPO Features:
+        - Clipped policy objective for stable updates
+        - Separate value function learning (critic)
+        - KL divergence penalty against reference policy
+        - Per-token log probability computation
+        - Periodic old actor updates
+    """
+    # Set models to training mode
     actor_model.train()
     critic_model.train()
 
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch["prompt"]  # list[str], length B
-        enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, 
-                       max_length=args.max_seq_len).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
+        
+        # Tokenize prompts
+        enc = tokenizer(
+            prompts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=args.max_seq_len
+        ).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
+        
         prompt_lengths = enc.attention_mask.sum(dim=1)  # [B]
 
+        # ========== Generation Phase ==========
         with torch.no_grad():
-            # DDP 模型需要使用 .module 访问 generate 方法
+            # DDP models need .module access for generate method
             model_for_gen = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
+            
+            # Generate responses
             gen_out = model_for_gen.generate(
-                input_ids=enc.input_ids, attention_mask=enc.attention_mask,
-                max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
-                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]
+                input_ids=enc.input_ids, 
+                attention_mask=enc.attention_mask,
+                max_new_tokens=args.max_gen_len, 
+                do_sample=True, 
+                temperature=0.8,
+                pad_token_id=tokenizer.pad_token_id, 
+                eos_token_id=tokenizer.eos_token_id
+            )  # [B, P+R]
 
-        responses_text = [tokenizer.decode(gen_out[i, prompt_lengths[i]:], skip_special_tokens=True) for i in range(len(prompts))]
+        # Extract response text and compute rewards
+        responses_text = [
+            tokenizer.decode(gen_out[i, prompt_lengths[i]:], skip_special_tokens=True) 
+            for i in range(len(prompts))
+        ]
         rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]
 
+        # ========== Value Estimation ==========
+        # Create mask for non-padded tokens
         full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
+        
+        # Get value estimates from critic
         values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
+        
+        # Extract final value for each sequence (at EOS position)
         last_indices = full_mask.sum(dim=1) - 1  # [B]
         values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]
+        
+        # Compute advantages (reward - value)
         advantages = rewards - values.detach()  # [B]
 
+        # ========== Log Probability Computation ==========
+        # Get log probabilities from actor model
         logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
         labels = gen_out[:, 1:].clone()  # [B, P+R-1]
+        
+        # Compute per-token log probabilities
         logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
-        seq_len = gen_out.size(1) - 1
+        
+        # Create mask for response tokens only (exclude prompt and padding)
+        gen_out = cast(torch.Tensor, gen_out) # NOTE: Check this!
+        seq_len = gen_out.size(1) - 1 
         resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_lengths.unsqueeze(1)
         final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1]
+        
+        # Sum log probabilities over response tokens
         actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B]
 
+        # ========== Old Actor & Reference Log Probabilities ==========
         with torch.no_grad():
+            # Old actor log probabilities (for importance ratio)
             old_logits = old_actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
             old_logp_tokens = F.log_softmax(old_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
             old_logp = (old_logp_tokens * final_mask).sum(dim=1)  # [B]
             
+            # Reference model log probabilities (for KL penalty)
             ref_logits = ref_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
             ref_logp_tokens = F.log_softmax(ref_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
             ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B]
 
+        # ========== Policy Loss (Clipped Objective) ==========
+        # KL divergences for monitoring
         kl = (actor_logp - old_logp).mean()  # scalar
         kl_ref = (actor_logp - ref_logp).mean()  # scalar
+        
+        # Policy ratio for importance sampling
         ratio = torch.exp(actor_logp - old_logp)  # [B]
+        
+        # Clipped surrogate objective
         surr1 = ratio * advantages  # [B]
         surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages  # [B]
         policy_loss = -torch.min(surr1, surr2).mean()  # scalar
+        
+        # Value function loss (MSE)
         value_loss = F.mse_loss(values, rewards)  # scalar
+        
+        # Total loss with KL penalty and value coefficient
         loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
         loss.backward()
 
+        # ========== Optimization Step ==========
         if (step + 1) % args.accumulation_steps == 0:
+            # Gradient clipping for both actor and critic
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)
             clip_grad_norm_(critic_model.parameters(), args.grad_clip)
+            
+            # Optimizer steps
             actor_optimizer.step()
             critic_optimizer.step()
+            
+            # Scheduler steps
             actor_scheduler.step()
             critic_scheduler.step()
+            
+            # Zero gradients
             actor_optimizer.zero_grad()
             critic_optimizer.zero_grad()
             torch.cuda.empty_cache()
 
+        # ========== Logging & Monitoring ==========
         if is_main_process():
+            # Compute average response length
             response_ids = gen_out[:, enc.input_ids.shape[1]:]
             is_eos = (response_ids == tokenizer.eos_token_id)
             eos_indices = torch.argmax(is_eos.int(), dim=1)
             has_eos = is_eos.any(dim=1)
-            lengths = torch.where(has_eos, eos_indices + 1, torch.tensor(response_ids.shape[1], device=is_eos.device))
+            lengths = torch.where(
+                has_eos, 
+                eos_indices + 1, 
+                torch.tensor(response_ids.shape[1], device=is_eos.device)
+            )
             avg_len = lengths.float().mean()
 
+            # Extract metrics
             actor_loss_val = policy_loss.item()
             critic_loss_val = value_loss.item()
             reward_val = rewards.mean().item()
@@ -196,8 +370,8 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             kl_ref_val = kl_ref.item()
             avg_len_val = avg_len.item()
             actor_lr = actor_optimizer.param_groups[0]['lr']
-            critic_lr = critic_optimizer.param_groups[0]['lr']
 
+            # Log to wandb
             if wandb is not None:
                 wandb.log({
                     "actor_loss": actor_loss_val,
@@ -209,123 +383,201 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                     "actor_lr": actor_lr,
                 })
 
-            Logger(f"Epoch: {epoch+1}, Step: {step}/{iters}, "
-                   f"Actor Loss: {actor_loss_val:.6f}, Critic Loss: {critic_loss_val:.6f}, "
-                   f"Reward: {reward_val:.6f}, KL: {kl_val:.6f}, KL_ref: {kl_ref_val:.6f}, "
-                   f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.2e}, Critic LR: {critic_lr:.2e}")
+            # Print log message
+            Logger(
+                f"Epoch: {epoch+1}, Step: {step}/{iters}, "
+                f"Actor Loss: {actor_loss_val:.6f}, Critic Loss: {critic_loss_val:.6f}, "
+                f"Reward: {reward_val:.6f}, KL: {kl_val:.6f}, KL_ref: {kl_ref_val:.6f}, "
+                f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.2e}"
+            )
 
+        # ========== Old Actor Update ==========
+        # Periodically update old actor model for importance sampling
         if (step + 1) % args.update_old_actor_freq == 0:
             state_dict = actor_model.module.state_dict() if isinstance(actor_model, DistributedDataParallel) else actor_model.state_dict()
             old_actor_model.load_state_dict({k: v.detach().cpu() for k, v in state_dict.items()})
             old_actor_model.to(args.device)
 
+        # ========== Checkpointing ==========
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             actor_model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            
+            # Extract actor state dict (handle DDP wrapper)
             actor_state = actor_model.module.state_dict() if isinstance(actor_model, DistributedDataParallel) else actor_model.state_dict()
+            
+            # Save actor weights in half precision
             torch.save({k: v.half() for k, v in actor_state.items()}, ckp)
             
-            # 使用 lm_checkpoint 保存完整状态（包括 critic）
-            lm_checkpoint(lm_config, weight=args.save_weight, model=actor_model, optimizer=actor_optimizer, 
-                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints',
-                         scheduler=actor_scheduler, critic_model=critic_model, 
-                         critic_optimizer=critic_optimizer, critic_scheduler=critic_scheduler)
+            # Save full checkpoint with all components
+            lm_checkpoint(
+                lm_config, weight=args.save_weight, model=actor_model, 
+                optimizer=actor_optimizer, epoch=epoch, step=step, wandb=wandb, 
+                save_dir='../checkpoints', scheduler=actor_scheduler, 
+                critic_model=critic_model, critic_optimizer=critic_optimizer, 
+                critic_scheduler=critic_scheduler
+            )
             actor_model.train()
 
 
 if __name__ == "__main__":
+    """
+    Main training script for MiniMind Proximal Policy Optimization (PPO).
+    
+    PPO is a reinforcement learning algorithm for aligning language models with
+    human preferences using an actor-critic architecture. It maintains:
+    - Actor model: The policy being optimized (generates responses)
+    - Old actor: Snapshot for importance sampling ratio computation
+    - Critic model: Value function for advantage estimation
+    - Reference model: Frozen model for KL penalty
+    
+    This implementation includes special support for reasoning models with structured
+    output format validation and reward shaping.
+    
+    Key PPO Features:
+        - Clipped policy objective for stable updates
+        - Separate value function learning
+        - KL divergence penalty against reference policy
+        - Importance sampling with old policy
+        - Periodic old actor updates
+    """
     parser = argparse.ArgumentParser(description="MiniMind PPO (Proximal Policy Optimization)")
-    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
-    parser.add_argument('--save_weight', default='ppo_actor', type=str, help="保存权重的前缀名")
-    parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=2, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=8e-8, help="Actor学习率")
-    parser.add_argument("--critic_learning_rate", type=float, default=8e-8, help="Critic学习率")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
-    parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=1, help="数据加载线程数")
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
-    parser.add_argument("--log_interval", type=int, default=1, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=10, help="模型保存间隔")
-    parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度")
-    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument('--max_seq_len', default=66, type=int, help="Prompt最大长度")
-    parser.add_argument("--max_gen_len", type=int, default=1536, help="生成的最大长度")
-    parser.add_argument("--data_path", type=str, default="../dataset/rlaif-mini.jsonl", help="RLAIF数据路径")
-    parser.add_argument("--clip_epsilon", type=float, default=0.1, help="PPO裁剪参数")
-    parser.add_argument("--vf_coef", type=float, default=0.5, help="Value function系数")
-    parser.add_argument("--kl_coef", type=float, default=0.02, help="KL散度惩罚系数")
-    parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1], help='推理模型类型（0=普通模型，1=推理模型）')
-    parser.add_argument("--update_old_actor_freq", type=int, default=4, help="更新old_actor_model的频率")
-    parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")
-    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
-    parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-PPO", help="wandb项目名")
+    
+    # Directory and naming
+    parser.add_argument("--save_dir", type=str, default="../out", help="Model save directory")
+    parser.add_argument('--save_weight', default='ppo_actor', type=str, help="Prefix for saved weights")
+    
+    # Training hyperparameters
+    parser.add_argument("--epochs", type=int, default=1, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size (number of prompts)")
+    parser.add_argument("--learning_rate", type=float, default=8e-8, help="Actor learning rate")
+    parser.add_argument("--critic_learning_rate", type=float, default=8e-8, help="Critic learning rate")
+    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="Training device")
+    parser.add_argument("--dtype", type=str, default="bfloat16", help="Mixed precision type")
+    parser.add_argument("--num_workers", type=int, default=1, help="Number of data loading workers")
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping threshold")
+    
+    # Logging and saving intervals
+    parser.add_argument("--log_interval", type=int, default=1, help="Logging interval (steps)")
+    parser.add_argument("--save_interval", type=int, default=10, help="Model saving interval (steps)")
+    
+    # Model architecture
+    parser.add_argument('--hidden_size', default=512, type=int, help="Hidden layer dimension")
+    parser.add_argument('--num_hidden_layers', default=8, type=int, help="Number of hidden layers")
+    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="Use MoE architecture (0=no, 1=yes)")
+    
+    # Generation parameters
+    parser.add_argument('--max_seq_len', default=66, type=int, help="Maximum prompt length")
+    parser.add_argument("--max_gen_len", type=int, default=1536, help="Maximum generation length")
+    
+    # RL parameters
+    parser.add_argument("--clip_epsilon", type=float, default=0.1, help="PPO clipping parameter epsilon")
+    parser.add_argument("--vf_coef", type=float, default=0.5, help="Value function coefficient")
+    parser.add_argument("--kl_coef", type=float, default=0.02, help="KL divergence penalty coefficient")
+    parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1], help='Model type (0=regular, 1=reasoning)')
+    parser.add_argument("--update_old_actor_freq", type=int, default=4, help="Frequency to update old actor model")
+    parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward model path")
+    
+    # Data and resumption
+    parser.add_argument("--data_path", type=str, default="../dataset/rlaif-mini.jsonl", help="RLAIF training data path")
+    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="Auto-detect and resume training (0=no, 1=yes)")
+    
+    # Experiment tracking
+    parser.add_argument("--use_wandb", action="store_true", help="Use wandb")
+    parser.add_argument("--wandb_project", type=str, default="MiniMind-PPO", help="wandb project name")
+    
     args = parser.parse_args()
 
-    # ========== 1. 初始化环境和随机种子 ==========
+    # ========== 1. Initialize environment and random seed ==========
+    # Set up distributed training if available (multi-GPU)
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized():
+        args.device = f"cuda:{local_rank}"
+    
+    # Set random seed for reproducibility, different per process
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     
-    # ========== 2. 配置目录、模型参数、检查ckp ==========
+    # ========== 2. Configure directories, model parameters, check checkpoint ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
-    # ========== 3. 设置混合精度 ==========
+    # Initialize model configuration
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size, 
+        num_hidden_layers=args.num_hidden_layers, 
+        use_moe=bool(args.use_moe)
+    )
+    
+    # Check for existing checkpoint if resuming
+    ckp_data = lm_checkpoint(
+        lm_config, weight=args.save_weight, save_dir='../checkpoints'
+    ) if args.from_resume == 1 else None
+    
+    # ========== 3. Set up mixed precision training ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    
+    # No-op context for CPU, autocast for CUDA
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
-    # ========== 4. 配wandb ==========
+    # ========== 4. Configure wandb logging ==========
+    # Note: This uses swanlab as a wandb-compatible experiment tracker
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-PPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
+        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume) #type: ignore 
     
-    # ========== 5. 初始化模型和数据 ==========
+    # ========== 5. Initialize models and data ==========
+    # Base weight to initialize from (reasoning or full_sft)
     base_weight = "reason" if args.reasoning == 1 else "full_sft"
-    # Actor模型
+    
+    # Actor model (policy being optimized)
     actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
-    tokenizer.padding_side = 'left'  # PPO需要左侧padding
-    # Old Actor模型
+    tokenizer.padding_side = 'left'  # PPO requires left-padding for generation
+    
+    # Old actor model (snapshot for importance sampling)
     old_actor_model, _ = init_model(lm_config, base_weight, device=args.device)
     old_actor_model = old_actor_model.eval().requires_grad_(False)
-    # Reference模型
+    
+    # Reference model (frozen, for KL penalty)
     ref_model, _ = init_model(lm_config, base_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
-    # Critic模型
+    
+    # Critic model (value function)
     moe_suffix = '_moe' if lm_config.use_moe else ''
     ckp = f'{args.save_dir}/{base_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
     state_dict = torch.load(ckp, map_location=args.device)
     critic_model = CriticModel(lm_config)
     critic_model.load_state_dict(state_dict, strict=False)
-    critic_model = critic_model.to(args.device)
-    # Reward模型
+    critic_model = critic_model.to(args.device) #type: ignore 
+    
+    # Reward model (external model for scoring)
     reward_model = AutoModel.from_pretrained(
         args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True
     )
     reward_model = reward_model.to(args.device).eval().requires_grad_(False)
     reward_tokenizer = AutoTokenizer.from_pretrained(args.reward_model_path, trust_remote_code=True)
-    # 数据和优化器
+    
+    # Training dataset and optimizers
     train_ds = RLAIFDataset(args.data_path, tokenizer, max_length=(args.max_seq_len + args.max_gen_len))
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     actor_optimizer = optim.AdamW(actor_model.parameters(), lr=args.learning_rate)
     critic_optimizer = optim.AdamW(critic_model.parameters(), lr=args.critic_learning_rate)
+    
+    # Count total iterations for learning rate schedulers
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
     total_optimizer_steps = (iters // args.accumulation_steps) * args.epochs
+    
+    # Cosine annealing schedulers
     actor_scheduler = CosineAnnealingLR(actor_optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
     critic_scheduler = CosineAnnealingLR(critic_optimizer, T_max=total_optimizer_steps, eta_min=args.critic_learning_rate / 10)
     
-    # ========== 6. 从ckp恢复状态 ==========
+    # ========== 6. Restore training state from checkpoint ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
         actor_model.load_state_dict(ckp_data['model'])
@@ -337,25 +589,58 @@ if __name__ == "__main__":
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
     
-    # ========== 7. DDP包模型 ==========
+    # ========== 7. Wrap models with DistributedDataParallel ==========
     if dist.is_initialized():
-        actor_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
-        critic_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
+        # Ignore certain buffers that don't need synchronization across GPUs
+        actor_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"} #type: ignore 
+        critic_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"} #type: ignore 
+        
+        # Wrap models for distributed training
         actor_model = DistributedDataParallel(actor_model, device_ids=[local_rank])
         critic_model = DistributedDataParallel(critic_model, device_ids=[local_rank])
-        old_actor_model.to(args.device)
+        
+        # Move old actor to device (not wrapped as it's only used for inference)
+        old_actor_model.to(args.device) #type: ignore 
     
-    # ========== 8. 开始训练 ==========
+    # ========== 8. Start main training loop ==========
     for epoch in range(start_epoch, args.epochs):
-        train_sampler and train_sampler.set_epoch(epoch)
-        if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
-            batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step + 1)
-            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
-            Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            ppo_train_epoch(epoch, loader, len(loader) + start_step + 1, old_actor_model, ref_model, 
-                           actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, start_step, wandb)
-        else:  # 默认从头开始
-            loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), 
-                              sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
-            ppo_train_epoch(epoch, loader, len(loader), old_actor_model, ref_model, 
-                           actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, 0, wandb)
+        # Set epoch for distributed sampler to ensure proper data shuffling
+        if train_sampler:
+            train_sampler.set_epoch(epoch)
+        
+        # Handle checkpoint resumption for first epoch
+        if epoch == start_epoch and start_step > 0:
+            # Skip already processed batches
+            batch_sampler = SkipBatchSampler(
+                train_sampler or range(len(train_ds)), 
+                args.batch_size, 
+                start_step + 1
+            )
+            loader = DataLoader(
+                train_ds, 
+                batch_sampler=batch_sampler, 
+                num_workers=args.num_workers, 
+                pin_memory=True
+            )
+            Logger(
+                f'Epoch [{epoch + 1}/{args.epochs}]: Skipping first {start_step} steps, '
+                f'starting from step {start_step + 1}'
+            )
+            ppo_train_epoch(
+                epoch, loader, len(loader) + start_step + 1, old_actor_model, ref_model,
+                actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, start_step, wandb
+            )
+        else:
+            # Standard dataloader for normal training
+            loader = DataLoader(
+                train_ds, 
+                batch_size=args.batch_size, 
+                shuffle=(train_sampler is None), 
+                sampler=train_sampler, 
+                num_workers=args.num_workers, 
+                pin_memory=True
+            )
+            ppo_train_epoch(
+                epoch, loader, len(loader), old_actor_model, ref_model,
+                actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, 0, wandb
+            )
