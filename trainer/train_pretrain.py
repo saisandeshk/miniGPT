@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 # Package path manipulation to ensure proper imports from parent directory
 __package__ = "trainer"
@@ -206,7 +207,9 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="Use MoE architecture (0=no, 1=yes)")
     
     # Data and initialization
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="Pretraining data path")
+    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="Pretraining data path (JSONL file)")
+    parser.add_argument("--data_config", type=str, default=None, help="Path to dataset mixture YAML config (alternative to --data_path)")
+    parser.add_argument("--use_prepared", action="store_true", help="Use pre-prepared JSONL from data_config (skip re-preparation)")
     parser.add_argument('--from_weight', default='none', type=str, help="Base weight for training, 'none' means train from scratch")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="Auto-detect & resume training (0=no, 1=yes)")
     
@@ -265,7 +268,56 @@ if __name__ == "__main__":
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     
     # Initialize pretraining dataset (large-scale text corpus)
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # Support two modes:
+    # 1. Direct JSONL file (--data_path)
+    # 2. Dataset mixture config (--data_config) with automatic preparation
+    if args.data_config:
+        from dataset.mixer import DatasetMixer
+        
+        if is_main_process():
+            print(f"Using dataset mixture config: {args.data_config}")
+        
+        # Load mixer configuration
+        mixer = DatasetMixer.from_yaml(args.data_config)
+        
+        # Validate mixture ratios
+        validation = mixer.validate_mixture()
+        if is_main_process():
+            print(f"Mixture validation: {validation}")
+        
+        if not validation['is_valid']:
+            raise ValueError("Invalid mixture ratios! They must sum to 1.0")
+        
+        # Generate output filenames based on config
+        config_name = Path(args.data_config).stem  # e.g., "default"
+        train_jsonl = f"../dataset/{mixer.config.phase}_{config_name}_train.jsonl"
+        
+        # Prepare dataset (or skip if already prepared)
+        if not args.use_prepared or not os.path.exists(train_jsonl):
+            if is_main_process():
+                print("Preparing dataset from mixture config...")
+                train_jsonl = mixer.prepare_dataset(
+                    output_file=train_jsonl,
+                    split="train"
+                )
+            
+            # Wait for main process to finish preparation
+            if dist.is_initialized():
+                dist.barrier()
+        else:
+            if is_main_process():
+                print(f"Using pre-prepared dataset: {train_jsonl}")
+        
+        # Load the prepared JSONL file
+        train_ds = PretrainDataset(train_jsonl, tokenizer, max_length=args.max_seq_len) #type: ignore
+        
+        if is_main_process():
+            print(f"Loaded {len(train_ds)} training samples from {train_jsonl}")
+    else:
+        # Original mode: direct JSONL file
+        train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len) #type: ignore
+        if is_main_process():
+            print(f"Loaded {len(train_ds)} training samples from {args.data_path}")
     
     # Set up distributed sampler for multi-GPU training
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None

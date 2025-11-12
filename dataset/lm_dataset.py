@@ -79,9 +79,9 @@ class PretrainDataset(Dataset):
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
 
         # Create input-target pairs for causal LM
-        X = torch.tensor(input_ids[:-1], dtype=torch.long)
-        Y = torch.tensor(input_ids[1:], dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        X = torch.tensor(input_ids[:-1], dtype=torch.long) # TODO: Check this! - Error: UserWarning: To copy construct from a tensor, it is recommended to use sourceTensor.detach().clone() or sourceTensor.detach().clone().requires_grad_(True), rather than torch.tensor(sourceTensor).
+        Y = torch.tensor(input_ids[1:], dtype=torch.long) # TODO: Check this! 
+        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long) # TODO: Check this! 
         return X, Y, loss_mask
 
 

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from model.model_minimind import MiniMindForCausalLM
 
 
@@ -176,7 +176,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+def init_model(lm_config, from_weight='pretrain', tokenizer_path='model', save_dir='out', device='cuda'):
     """
     Initialize model and tokenizer from pretrained weights or scratch.
     
@@ -190,7 +190,16 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
     Returns:
         tuple: (model, tokenizer) where model is on the specified device.
     """
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    # Load tokenizer directly from local files
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=os.path.join(tokenizer_path, 'tokenizer.json'))
+    
+    # Set special tokens if not already set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token if tokenizer.eos_token else '<|endoftext|>'
+    if tokenizer.eos_token is None:
+        tokenizer.eos_token = '<|endoftext|>'
+    if tokenizer.bos_token is None:
+        tokenizer.bos_token = '<|endoftext|>'
     model = MiniMindForCausalLM(lm_config)
 
     if from_weight != 'none':

@@ -1,0 +1,54 @@
+PHASE 1 IMPLEMENTATION - FILE TREE
+=====================================
+
+Configuration Files:
+  config/data/
+  ├── pretrain/phase1/
+  │   └── default.yaml                 ✅ Default mixture config (TinyStories)
+  └── README.md                        ✅ Configuration guide
+
+Core Implementation:
+  dataset/
+  ├── loader.py                        ✅ Dataset loading (HF, JSONL, Parquet)
+  ├── mixer.py                         ✅ Mixing engine + JSONL generation
+  ├── filters.py                       ✅ Quality/length filters
+  └── lm_dataset.py                    ℹ️  Existing (no changes needed)
+
+Tests:
+  tests/
+  ├── test_mixer.py                    ✅ Mixer functionality tests
+  ├── test_filters.py                  ✅ Filter tests
+  └── test_loader.py                   ✅ Loader tests
+
+Scripts & Tools:
+  scripts/
+  ├── test_mixer_pipeline.py           ✅ End-to-end pipeline test
+  └── prepare_dataset.py               ✅ CLI for dataset preparation
+
+Integration:
+  trainer/
+  └── train_pretrain.py                ✅ UPDATED - Mixer support added
+
+Documentation:
+  docs/
+  ├── PHASE1_UPDATED_APPROACH.md       ✅ Technical design document
+  ├── IMPLEMENTATION_GUIDE.md          ✅ Updated with new approach
+  ├── PROJECT_SUMMARY.md               ✅ Project overview
+  ├── QUICKSTART.md                    ✅ Day-by-day guide
+  └── README.md                        ✅ Documentation hub
+  
+  Root:
+  ├── PHASE1_QUICKSTART.md             ✅ Quick start guide
+  └── PHASE1_FILES.txt                 ✅ This file
+
+Quick Commands:
+  # Test pipeline
+  python scripts/test_mixer_pipeline.py
+  
+  # Prepare dataset
+  python scripts/prepare_dataset.py --config config/data/pretrain/phase1/default.yaml
+  
+  # Train
+  python trainer/train_pretrain.py --data_config config/data/pretrain/phase1/default.yaml --use_prepared --epochs 1
+
+Status: ✅ READY FOR TESTING

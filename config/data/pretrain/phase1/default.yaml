@@ -1,0 +1,29 @@
+metadata:
+  phase: "pretrain_phase1"
+  description: "Default pretraining mixture - TinyStories for testing"
+  total_tokens: 50_000_000  # 50M tokens (~100MB)
+  max_seq_length: 512
+  version: "1.0"
+
+datasets:
+  # TinyStories - Small, fast dataset for testing
+  - name: "tinystories"
+    source: "roneneldan/TinyStories"
+    mix_ratio: 1.0  # 100% for now (single dataset)
+    format: "huggingface"
+    text_field: "text"
+    splits: ["train"]
+    max_samples: 100000  # Limit for testing
+    
+    filters:
+      - type: "length"
+        min_length: 50
+        max_length: 2000
+      
+      - type: "quality"
+        min_score: 0.0  # Accept all for now
+
+validation:
+  ratio: 0.05  # 5% for validation
+  seed: 42
+  stratified: true
