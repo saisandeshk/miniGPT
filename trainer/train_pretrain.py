@@ -386,7 +386,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="Use MoE architecture (0=no, 1=yes)")
     
     # Data and initialization
-    parser.add_argument("--data_path", type=str, default="dataset/pretrain_hq.jsonl", help="Pretraining data path (JSONL file)")
+    parser.add_argument("--data_path", type=str, default="dataset/pretrain_phase1_default_train.jsonl", help="Pretraining data path (JSONL file)")
     parser.add_argument("--data_config", type=str, default=None, help="Path to dataset mixture YAML config (alternative to --data_path)")
     parser.add_argument("--use_prepared", action="store_true", help="Use pre-prepared JSONL from data_config (skip re-preparation)")
     parser.add_argument('--from_weight', default='none', type=str, help="Base weight for training, 'none' means train from scratch")
@@ -394,7 +394,7 @@ if __name__ == "__main__":
     
     # Experiment tracking
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb project name")
+    parser.add_argument("--wandb_project", type=str, default="miniGPT-test-pretrain", help="wandb project name")
     
     args = parser.parse_args()
 
