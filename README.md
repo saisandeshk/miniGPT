@@ -1,3 +1,4 @@
+bash ```
 miniGPT/
 ├── config/                              # All configuration files
 │   ├── data/                            # Dataset mixture configs
@@ -152,3 +153,4 @@ miniGPT/
 ├── requirements.txt
 ├── README_en.md
 └── LICENSE
+```
