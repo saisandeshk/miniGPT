@@ -20,7 +20,7 @@ from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import DPODataset
 from trainer.trainer_utils import (
     get_lr, Logger, is_main_process, lm_checkpoint, 
-    init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+    init_distributed_mode, setup_seed, init_model, SkipBatchSampler, calculate_mfu
 )
 
 # Suppress all warnings for cleaner output
@@ -120,7 +120,8 @@ def train_epoch(
     lm_config: MiniMindConfig,
     start_step: int = 0,
     wandb=None,
-    beta: float = 0.1
+    beta: float = 0.1, 
+    eval_loader: DataLoader | None = None, 
 ) -> None:
     """
     Train model for one epoch using Direct Preference Optimization (DPO).
@@ -146,6 +147,13 @@ def train_epoch(
         - Beta parameter controls how much policy can deviate from reference
     """
     start_time = time.time()
+    
+    # Initialize tracking variables for metrics
+    total_tokens_seen = 0
+    grad_norm = 0.0
+    
+    # Calculate model FLOPs for MFU calculation
+    model_flops_per_token = 6 * sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     for step, batch in enumerate(loader, start=start_step + 1):
         # Load chosen/preferred and rejected responses
@@ -191,12 +199,15 @@ def train_epoch(
 
         # ========== Backward Pass ==========
         scaler.scale(loss).backward()
+        
+        # Track tokens seen
+        total_tokens_seen += mask.sum().item()
 
         # ========== Optimizer Step ==========
         if (step + 1) % args.accumulation_steps == 0:
             # Unscale gradients before clipping
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
             
             # Optimizer step and zero gradients
             scaler.step(optimizer)
@@ -211,13 +222,64 @@ def train_epoch(
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
             
+            # Calculate throughput metrics
+            tokens_per_sec = total_tokens_seen / spend_time if spend_time > 0 else 0
+            samples_per_sec = (step * args.batch_size) / spend_time if spend_time > 0 else 0
+            steps_per_sec = step / spend_time if spend_time > 0 else 0
+            
+            # Calculate MFU (Model FLOPs Utilization)
+            mfu = calculate_mfu(model_flops_per_token, tokens_per_sec, args.device)
+            
+            # Global step across all epochs
+            global_step = epoch * iters + step
+            
             Logger(
                 f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) '
-                f'loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:'
+                f'loss:{current_loss:.6f} lr:{current_lr:.12f} '
+                f'grad_norm:{grad_norm:.4f} tokens/s:{tokens_per_sec:.0f} '
+                f'MFU:{mfu:.2f}% epoch_Time:{eta_min}min'
             )
             
-            if wandb: 
-                wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
+            # Log to wandb with comprehensive metrics
+            if wandb:
+                log_dict = {
+                    # Training metrics
+                    "train/loss": current_loss,
+                    "train/learning_rate": current_lr,
+                    "train/grad_norm": grad_norm,
+                    "train/epoch": epoch + (step / iters),
+                    "train/global_step": global_step,
+                    
+                    # Throughput metrics
+                    "train/tokens_per_second": tokens_per_sec,
+                    "train/samples_per_second": samples_per_sec,
+                    "train/steps_per_second": steps_per_sec,
+                    "train/num_input_tokens_seen": total_tokens_seen,
+                    
+                    # Efficiency metrics
+                    "train/mfu_percent": mfu,
+                    "train/eta_minutes": eta_min,
+                    
+                    # System metrics
+                    "system/epoch_time": spend_time / 60,  # in minutes
+                }
+                wandb.log(log_dict, step=global_step)
+
+        # Evaluation
+        if eval_loader and args.eval_interval > 0:
+            if step % args.eval_interval == 0 or step == iters - 1:
+                if is_main_process():
+                    Logger("Running DPO evaluation...")
+                eval_metrics = evaluate_dpo(
+                    model, ref_model, eval_loader, args.device,  # <-- use model
+                    autocast_ctx, beta=beta, max_batches=args.eval_batches  # <-- use beta arg
+                )
+
+                if is_main_process():
+                    Logger(f"Eval loss: {eval_metrics['eval/loss']:.6f}, Accuracy: {eval_metrics['eval/accuracy']:.4f}")
+
+                if wandb:
+                    wandb.log(eval_metrics, step=epoch * iters + step)
 
         # ========== Checkpointing ==========
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
@@ -241,9 +303,99 @@ def train_epoch(
             lm_checkpoint(
                 lm_config, weight=args.save_weight, model=model, 
                 optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, 
-                wandb=wandb, save_dir='../checkpoints'
+                wandb=wandb, save_dir='checkpoints'
             )
             model.train()
+
+def get_batch_logps(model, input_ids, labels, mask):
+    """
+    Compute log probabilities for a batch.
+    
+    Args:
+        model: The model to use
+        input_ids: Input token IDs
+        labels: Target token IDs
+        mask: Loss mask
+    
+    Returns:
+        Per-token log probabilities (batch_size, seq_len)
+    """
+    outputs = model(input_ids)
+    logits = outputs.logits
+    log_probs = logits_to_log_probs(logits, labels)
+    return log_probs
+
+
+def evaluate_dpo(policy_model, ref_model, eval_loader, device, autocast_ctx, beta=0.1, max_batches=None):
+    """
+    Evaluate DPO model on validation set.
+    
+    Args:
+        policy_model: Policy model being trained
+        ref_model: Reference model (frozen)
+        eval_loader: Validation data loader
+        device: Device to run on
+        autocast_ctx: Mixed precision context
+        beta: DPO beta parameter
+        max_batches: Maximum number of batches
+    
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    policy_model.eval()
+    ref_model.eval()
+    
+    total_loss = 0.0
+    total_correct = 0
+    num_batches = 0
+    
+    eval_start = time.time()
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(eval_loader):
+            if max_batches and batch_idx >= max_batches:
+                break
+            
+            # Move batch to device
+            x_chosen = batch['x_chosen'].to(device)
+            y_chosen = batch['y_chosen'].to(device)
+            mask_chosen = batch['mask_chosen'].to(device)
+            x_rejected = batch['x_rejected'].to(device)
+            y_rejected = batch['y_rejected'].to(device)
+            mask_rejected = batch['mask_rejected'].to(device)
+            
+            with autocast_ctx:
+                # Get policy logprobs
+                policy_chosen_logps = get_batch_logps(policy_model, x_chosen, y_chosen, mask_chosen)
+                policy_rejected_logps = get_batch_logps(policy_model, x_rejected, y_rejected, mask_rejected)
+                
+                # Get reference logprobs
+                ref_chosen_logps = get_batch_logps(ref_model, x_chosen, y_chosen, mask_chosen)
+                ref_rejected_logps = get_batch_logps(ref_model, x_rejected, y_rejected, mask_rejected)
+                
+                # Compute DPO loss
+                logits = (policy_chosen_logps - ref_chosen_logps) - (policy_rejected_logps - ref_rejected_logps)
+                loss = -torch.nn.functional.logsigmoid(beta * logits).mean()
+                
+                # Compute accuracy (chosen > rejected)
+                correct = (logits > 0).float().sum().item()
+                
+                total_loss += loss.item()
+                total_correct += correct
+                num_batches += 1
+    
+    eval_time = time.time() - eval_start
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    accuracy = total_correct / num_batches if num_batches > 0 else 0.0
+    
+    policy_model.train()
+    
+    return {
+        'eval/loss': avg_loss,
+        'eval/accuracy': accuracy,
+        'eval/runtime': eval_time,
+        'eval/num_batches': num_batches,
+    }
 
 
 if __name__ == "__main__":
@@ -261,7 +413,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind DPO (Direct Preference Optimization)")
     
     # Directory and naming
-    parser.add_argument("--save_dir", type=str, default="../out", help="Model save directory")
+    parser.add_argument("--save_dir", type=str, default="out", help="Model save directory")
     parser.add_argument('--save_weight', default='dpo', type=str, help="Prefix for saved weights")
     
     # Training hyperparameters
@@ -277,6 +429,8 @@ if __name__ == "__main__":
     # Logging and saving intervals
     parser.add_argument("--log_interval", type=int, default=100, help="Logging interval (steps)")
     parser.add_argument("--save_interval", type=int, default=100, help="Model saving interval (steps)")
+    parser.add_argument("--eval_interval", type=int, default=500, help="Evaluation interval (steps), 0 to disable")
+    parser.add_argument("--eval_batches", type=int, default=100, help="Number of batches to use for evaluation")
     
     # Model architecture
     parser.add_argument('--hidden_size', default=512, type=int, help="Hidden layer dimension")
@@ -285,7 +439,10 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="Use MoE architecture (0=no, 1=yes)")
     
     # Data and initialization
-    parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl", help="DPO training data path")
+    parser.add_argument("--data_path", type=str, default="dataset/dpo_helpfulness_train.jsonl", help="DPO training data path")
+    parser.add_argument("--data_config", type=str, default=None, help="Path to dataset mixture YAML config")
+    parser.add_argument("--use_prepared", action="store_true", help="Use pre-prepared JSONL")
+    
     parser.add_argument('--from_weight', default='full_sft', type=str, help="Base weight for training")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="Auto-detect & resume training (0=no, 1=yes)")
     
@@ -294,7 +451,7 @@ if __name__ == "__main__":
     
     # Experiment tracking
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-DPO", help="wandb project name")
+    parser.add_argument("--wandb_project", type=str, default="miniGPT-test-dpo", help="wandb project name")
     
     args = parser.parse_args()
 
@@ -319,7 +476,7 @@ if __name__ == "__main__":
     
     # Check for existing checkpoint if resuming
     ckp_data = lm_checkpoint(
-        lm_config, weight=args.save_weight, save_dir='../checkpoints'
+        lm_config, weight=args.save_weight, save_dir='checkpoints'
     ) if args.from_resume == 1 else None
     
     # ========== 3. Set up mixed precision training ==========
@@ -330,14 +487,23 @@ if __name__ == "__main__":
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
     # ========== 4. Configure wandb logging ==========
-    # Note: Uses swanlab as a wandb-compatible experiment tracker
     wandb = None
     if args.use_wandb and is_main_process():
-        import swanlab as wandb
+        import wandb as wandb_module
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-DPO-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume) #type: ignore 
+        wandb_run_name = (
+            f"miniGPT-DPO-Epoch-{args.epochs}-BatchSize-{args.batch_size}-"
+            f"LearningRate-{args.learning_rate}"
+        )
+        wandb_run = wandb_module.init(
+            project=args.wandb_project,
+            name=wandb_run_name,
+            id=wandb_id,
+            resume=resume
+        )
+        wandb = wandb_module  # use module for logging
+        print(f"✅ Wandb initialized: {wandb_run.name} (ID: {wandb_run.id})")
     
     # ========== 5. Initialize policy and reference models ==========
     # Initialize policy model (being trained)
@@ -352,8 +518,57 @@ if __name__ == "__main__":
     Logger(f'Reference model parameters: {sum(p.numel() for p in ref_model.parameters()) / 1e6:.3f} M')
     
     # Initialize dataset and training components
+    # Dataset preparation with mixer
+    if args.data_config:
+        from pathlib import Path
+        from dataset.mixer import DatasetMixer
+        
+        if is_main_process():
+            print(f"Using dataset config: {args.data_config}")
+        
+        mixer = DatasetMixer.from_yaml(args.data_config)
+        validation = mixer.validate_mixture()
+        
+        if not validation['is_valid']:
+            raise ValueError("Invalid mixture ratios!")
+        
+        config_name = Path(args.data_config).stem
+        train_jsonl = f"dataset/{mixer.config.phase}_{config_name}_train.jsonl"
+        val_jsonl = f"dataset/{mixer.config.phase}_{config_name}_val.jsonl"
+        
+        if not args.use_prepared or not os.path.exists(train_jsonl):
+            if is_main_process():
+                mixer.prepare_dataset(train_jsonl, split="train")
+                mixer.prepare_dataset(val_jsonl, split="validation")
+            
+            if dist.is_initialized():
+                dist.barrier()
+        
+        args.data_path = train_jsonl
+        val_data_path = val_jsonl
+    else:
+        val_data_path = None
+    
     train_ds = DPODataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    
+    # Create evaluation dataset
+    eval_ds = None
+    if val_data_path and os.path.exists(val_data_path):
+        eval_ds = DPODataset(val_data_path, tokenizer, max_length=args.max_seq_len)
+        if is_main_process():
+            print(f"Loaded {len(eval_ds)} validation samples")
+    
+    eval_loader = None 
+    if eval_ds: 
+        eval_loader = DataLoader(
+            eval_ds, 
+            batch_size=args.batch_size, 
+            shuffle=False,
+            num_workers=args.num_workers, 
+            pin_memory=True
+        )
+    
     scaler = GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
@@ -396,7 +611,7 @@ if __name__ == "__main__":
                 f'Epoch [{epoch + 1}/{args.epochs}]: Skipping first {start_step} steps, '
                 f'starting from step {start_step + 1}'
             )
-            train_epoch(epoch, loader, len(loader) + start_step + 1, ref_model, lm_config, start_step, wandb, args.beta)
+            train_epoch(epoch, loader, len(loader) + start_step + 1, ref_model, lm_config, start_step, wandb, args.beta, eval_loader)
         else:
             # Standard dataloader for normal training
             loader = DataLoader(
@@ -407,4 +622,4 @@ if __name__ == "__main__":
                 num_workers=args.num_workers,
                 pin_memory=True
             )
-            train_epoch(epoch, loader, len(loader), ref_model, lm_config, 0, wandb, args.beta)
+            train_epoch(epoch, loader, len(loader), ref_model, lm_config, 0, wandb, args.beta, eval_loader)

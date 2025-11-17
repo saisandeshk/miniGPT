@@ -18,7 +18,7 @@ from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
 from trainer.trainer_utils import (
     get_lr, Logger, is_main_process, lm_checkpoint, 
-    init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+    init_distributed_mode, setup_seed, init_model, SkipBatchSampler, calculate_mfu
 )
 
 # Suppress all warnings for cleaner output
@@ -30,7 +30,8 @@ def train_epoch(
     loader: DataLoader, 
     iters: int, 
     start_step: int = 0, 
-    wandb=None
+    wandb=None,
+    eval_loader=None
 ) -> None:
     """
     Train the model for a single epoch using standard supervised fine-tuning.
@@ -58,6 +59,13 @@ def train_epoch(
     # Initialize loss function and timer
     loss_fct = nn.CrossEntropyLoss(reduction='none')  # No reduction to apply mask later
     start_time = time.time()
+    
+    # Initialize tracking variables for metrics
+    total_tokens_seen = 0
+    grad_norm = 0.0
+    
+    # Calculate model FLOPs for MFU calculation
+    model_flops_per_token = 6 * sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     # Iterate through data batches, starting from the specified step
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
@@ -92,12 +100,15 @@ def train_epoch(
 
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
+        
+        # Track tokens seen
+        total_tokens_seen += loss_mask.sum().item()
 
         # Update weights only every accumulation_steps
         if (step + 1) % args.accumulation_steps == 0:
             # Unscale gradients before clipping
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item()
 
             # Optimizer step and zero gradients
             scaler.step(optimizer)
@@ -114,13 +125,65 @@ def train_epoch(
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60  # Estimated time remaining
             
+            # Calculate throughput metrics
+            tokens_per_sec = total_tokens_seen / spend_time if spend_time > 0 else 0
+            samples_per_sec = (step * args.batch_size) / spend_time if spend_time > 0 else 0
+            steps_per_sec = step / spend_time if spend_time > 0 else 0
+            
+            # Calculate MFU (Model FLOPs Utilization)
+            mfu = calculate_mfu(model_flops_per_token, tokens_per_sec, args.device)
+            
+            # Global step across all epochs
+            global_step = epoch * iters + step
+            
             Logger(
                 f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) '
-                f'loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:'
+                f'loss:{current_loss:.6f} lr:{current_lr:.12f} '
+                f'grad_norm:{grad_norm:.4f} tokens/s:{tokens_per_sec:.0f} '
+                f'MFU:{mfu:.2f}% epoch_Time:{eta_min}min'
             )
             
-            if wandb: 
-                wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
+            # Log to wandb with comprehensive metrics
+            if wandb:
+                log_dict = {
+                    # Training metrics
+                    "train/loss": current_loss,
+                    "train/learning_rate": current_lr,
+                    "train/grad_norm": grad_norm,
+                    "train/epoch": epoch + (step / iters),
+                    "train/global_step": global_step,
+                    
+                    # Throughput metrics
+                    "train/tokens_per_second": tokens_per_sec,
+                    "train/samples_per_second": samples_per_sec,
+                    "train/steps_per_second": steps_per_sec,
+                    "train/num_input_tokens_seen": total_tokens_seen,
+                    
+                    # Efficiency metrics
+                    "train/mfu_percent": mfu,
+                    "train/eta_minutes": eta_min,
+                    
+                    # System metrics
+                    "system/epoch_time": spend_time / 60,  # in minutes
+                }
+                wandb.log(log_dict, step=global_step)
+
+        # Evaluation loop (periodic validation)
+        if eval_loader and args.eval_interval > 0:
+            if step % args.eval_interval == 0 or step == iters - 1:
+                if is_main_process():
+                    Logger("Running evaluation...")
+                
+                eval_metrics = evaluate(
+                    model, eval_loader, args.device, 
+                    autocast_ctx, max_batches=args.eval_batches
+                )
+                
+                if is_main_process():
+                    Logger(f"Eval loss: {eval_metrics['eval/loss']:.6f}, Eval runtime: {eval_metrics['eval/runtime']:.2f}s")
+                
+                if wandb:
+                    wandb.log(eval_metrics, step=epoch * iters + step)
 
         # Model checkpointing (only on main process in distributed training)
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
@@ -143,9 +206,70 @@ def train_epoch(
             # Save full checkpoint with optimizer state for resumption
             lm_checkpoint(
                 lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
-                epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler
+                epoch=epoch, step=step, wandb=wandb, save_dir='checkpoints', scaler=scaler
             )
             model.train()
+
+
+
+
+def evaluate(model, eval_loader, device, autocast_ctx, max_batches=None):
+    """
+    Evaluate SFT model on validation set.
+    
+    Args:
+        model: Model to evaluate
+        eval_loader: Validation data loader
+        device: Device to run on
+        autocast_ctx: Mixed precision context
+        max_batches: Maximum number of batches to evaluate
+    
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    model.eval()
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    total_loss = 0.0
+    total_tokens = 0
+    num_batches = 0
+    
+    eval_start = time.time()
+    
+    with torch.no_grad():
+        for batch_idx, (X, Y, loss_mask) in enumerate(eval_loader):
+            if max_batches and batch_idx >= max_batches:
+                break
+                
+            X = X.to(device)
+            Y = Y.to(device)
+            loss_mask = loss_mask.to(device)
+            
+            with autocast_ctx:
+                res = model(X)
+                loss = loss_fct(
+                    res.logits.view(-1, res.logits.size(-1)),
+                    Y.view(-1)
+                ).view(Y.size())
+                
+                # Apply mask and sum
+                batch_loss = (loss * loss_mask).sum().item()
+                batch_tokens = loss_mask.sum().item()
+                
+                total_loss += batch_loss
+                total_tokens += batch_tokens
+                num_batches += 1
+    
+    eval_time = time.time() - eval_start
+    avg_loss = total_loss / total_tokens if total_tokens > 0 else 0.0
+    
+    model.train()
+    
+    return {
+        'eval/loss': avg_loss,
+        'eval/runtime': eval_time,
+        'eval/num_batches': num_batches,
+        'eval/total_tokens': total_tokens,
+    }
 
 
 if __name__ == "__main__":
@@ -166,7 +290,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Full Supervised Fine-Tuning")
     
     # Directory and naming
-    parser.add_argument("--save_dir", type=str, default="../out", help="Model save directory")
+    parser.add_argument("--save_dir", type=str, default="out", help="Model save directory")
     parser.add_argument('--save_weight', default='full_sft', type=str, help="Prefix for saved weights")
     
     # Training hyperparameters
@@ -182,6 +306,9 @@ if __name__ == "__main__":
     # Logging and saving intervals
     parser.add_argument("--log_interval", type=int, default=100, help="Logging interval (steps)")
     parser.add_argument("--save_interval", type=int, default=100, help="Model saving interval (steps)")
+    parser.add_argument("--eval_interval", type=int, default=500, help="Evaluation interval (steps), 0 to disable")
+    parser.add_argument("--eval_batches", type=int, default=100, help="Number of batches to use for evaluation")
+    
     
     # Model architecture
     parser.add_argument('--hidden_size', default=512, type=int, help="Hidden layer dimension")
@@ -190,13 +317,16 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="Use MoE architecture (0=no, 1=yes)")
     
     # Data and initialization
-    parser.add_argument("--data_path", type=str, default="../dataset/sft_mini_512.jsonl", help="Training data path")
-    parser.add_argument('--from_weight', default='pretrain', type=str, help="Base weight for training, 'none' means train from scratch")
+    parser.add_argument("--data_path", type=str, default="dataset/sft_general_train.jsonl", help="Training data path")
+    parser.add_argument("--data_config", type=str, default=None, help="Path to dataset mixture YAML config (alternative to --data_path)")
+    parser.add_argument("--use_prepared", action="store_true", help="Use pre-prepared JSONL from data_config (skip re-preparation)")
+    
+    parser.add_argument('--from_weight', default='midtrain', type=str, help="Base weight for training, 'none' means train from scratch")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="Auto-detect and resume training (0=no, 1=yes)")
     
     # Experiment tracking
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb logging")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb project name")
+    parser.add_argument("--wandb_project", type=str, default="miniGPT-test-sft", help="wandb project name")
     
     args = parser.parse_args()
 
@@ -221,7 +351,7 @@ if __name__ == "__main__":
     
     # Check for existing checkpoint if resuming training
     ckp_data = lm_checkpoint(
-        lm_config, weight=args.save_weight, save_dir='../checkpoints'
+        lm_config, weight=args.save_weight, save_dir='checkpoints'
     ) if args.from_resume == 1 else None
     
     # ========== 3. Set up mixed precision training ==========
@@ -232,28 +362,103 @@ if __name__ == "__main__":
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
     # ========== 4. Configure wandb logging ==========
-    # Note: This imports swanlab as wandb, which is a Chinese experiment tracking platform
     wandb = None
     if args.use_wandb and is_main_process():
-        import swanlab as wandb
+        import wandb as wandb_module
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = (
-            f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-"
+            f"miniGPT-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-"
             f"LearningRate-{args.learning_rate}"
         )
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume) #type: ignore 
+        wandb_run = wandb_module.init(
+            project=args.wandb_project,
+            name=wandb_run_name,
+            id=wandb_id,
+            resume=resume
+        )
+        wandb = wandb_module  # use module for logging
+        print(f"✅ Wandb initialized: {wandb_run.name} (ID: {wandb_run.id})")
     
     # ========== 5. Initialize model, dataset, and optimizer ==========
     # Initialize model and tokenizer
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     
     # Initialize supervised fine-tuning dataset
+    # ========== Dataset Preparation with Mixer Support ==========
+    if args.data_config:
+        from pathlib import Path
+        from dataset.mixer import DatasetMixer
+        
+        if is_main_process():
+            print(f"Using dataset mixture config: {args.data_config}")
+        
+        # Load mixer configuration
+        mixer = DatasetMixer.from_yaml(args.data_config)
+        
+        # Validate mixture ratios
+        validation = mixer.validate_mixture()
+        if is_main_process():
+            print(f"Mixture validation: {validation}")
+        
+        if not validation['is_valid']:
+            raise ValueError("Invalid mixture ratios! They must sum to 1.0")
+        
+        # Generate output filenames
+        config_name = Path(args.data_config).stem
+        train_jsonl = f"dataset/{mixer.config.phase}_{config_name}_train.jsonl"
+        val_jsonl = f"dataset/{mixer.config.phase}_{config_name}_val.jsonl"
+        
+        # Prepare datasets if needed
+        if not args.use_prepared or not os.path.exists(train_jsonl):
+            if is_main_process():
+                print("Preparing datasets from mixture...")
+                mixer.prepare_dataset(train_jsonl, split="train")
+                mixer.prepare_dataset(val_jsonl, split="validation")
+                print(f"✅ Prepared: {train_jsonl}")
+                print(f"✅ Prepared: {val_jsonl}")
+            
+            # Sync processes
+            if dist.is_initialized():
+                dist.barrier()
+        else:
+            if is_main_process():
+                print(f"Using pre-prepared datasets:")
+                print(f"  Train: {train_jsonl}")
+                print(f"  Val: {val_jsonl}")
+        
+        # Use prepared files
+        args.data_path = train_jsonl
+        val_data_path = val_jsonl
+    else:
+        val_data_path = None  # No validation data without config
+    
+    # ========== Load Training Dataset ==========
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    
+    
+    # Create evaluation dataset if validation file exists
+    eval_ds = None
+    if val_data_path and os.path.exists(val_data_path):
+        eval_ds = SFTDataset(val_data_path, tokenizer, max_length=args.max_seq_len)
+        if is_main_process():
+            print(f"Loaded {len(eval_ds)} validation samples")
     
     # Set up distributed sampler for multi-GPU training
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     
+
+    # Create evaluation loader if eval dataset exists
+    eval_loader = None
+    if eval_ds is not None:
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+
     # Initialize gradient scaler for mixed precision
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     
@@ -299,7 +504,7 @@ if __name__ == "__main__":
                 f'Epoch [{epoch + 1}/{args.epochs}]: Skipping first {start_step} steps, '
                 f'starting from step {start_step + 1}'
             )
-            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
+            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb, eval_loader)
         else:
             # Standard dataloader for normal training
             loader = DataLoader(
@@ -310,4 +515,4 @@ if __name__ == "__main__":
                 num_workers=args.num_workers, 
                 pin_memory=True
             )
-            train_epoch(epoch, loader, len(loader), 0, wandb)
+            train_epoch(epoch, loader, len(loader), 0, wandb, eval_loader)

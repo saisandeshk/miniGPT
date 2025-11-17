@@ -1,0 +1,28 @@
+metadata:
+  phase: "sft"
+  description: "Code-focused instruction fine-tuning"
+  total_tokens: 8_000_000
+  max_seq_length: 1024  # Longer for code
+  version: "1.0"
+
+datasets:
+  # 100% - Code generation instructions
+  - name: "code_alpaca"
+    source: "sahil2801/CodeAlpaca-20k"
+    mix_ratio: 1.0
+    format: "huggingface"
+    text_field: "output"  # Has instruction, input, output
+    splits: ["train"]
+    max_samples: 20000  # Full dataset
+    
+    filters:
+      - type: "length"
+        min_length: 30
+        max_length: 3000
+      
+      - type: "code_quality"
+        min_code_ratio: 0.1
+
+validation:
+  ratio: 0.05
+  seed: 42

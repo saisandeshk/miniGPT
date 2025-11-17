@@ -2,9 +2,10 @@
 Dataset loading utilities for various sources and formats.
 
 Currently focuses on HuggingFace datasets with basic support for local files.
+Includes format converters to standardize different dataset schemas.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datasets import load_dataset, Dataset
 
 
@@ -149,3 +150,127 @@ def get_dataset_info(source: str, format: str = 'huggingface') -> dict:
             }
     
     return {'source': source, 'format': format, 'info': 'unavailable'}
+
+
+def convert_alpaca_to_conversations(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert Alpaca format to standard conversations format.
+    
+    Alpaca format:
+        {"instruction": "...", "input": "...", "output": "..."}
+    
+    Conversations format:
+        {"conversations": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+    """
+    conversations = []
+    
+    # Combine instruction and input for user message
+    user_content = sample.get("instruction", "")
+    if sample.get("input"):
+        user_content += "\n" + sample["input"]
+    
+    conversations.append({"role": "user", "content": user_content})
+    conversations.append({"role": "assistant", "content": sample.get("output", "")})
+    
+    return {"conversations": conversations, "text": user_content + "\n" + sample.get("output", "")}
+
+
+def convert_code_alpaca_to_conversations(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert CodeAlpaca format to conversations.
+    
+    Similar to Alpaca but code-focused.
+    """
+    conversations = []
+    
+    user_content = sample.get("instruction", "")
+    if sample.get("input"):
+        user_content += "\n" + sample["input"]
+    
+    conversations.append({"role": "user", "content": user_content})
+    conversations.append({"role": "assistant", "content": sample.get("output", "")})
+    
+    return {"conversations": conversations, "text": user_content + "\n" + sample.get("output", "")}
+
+
+def convert_gsm8k_to_conversations(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert GSM8K format to conversations.
+    
+    GSM8K format:
+        {"question": "...", "answer": "..."}
+    """
+    conversations = []
+    
+    conversations.append({"role": "user", "content": sample.get("question", "")})
+    conversations.append({"role": "assistant", "content": sample.get("answer", "")})
+    
+    return {"conversations": conversations, "text": sample.get("question", "") + "\n" + sample.get("answer", "")}
+
+
+def convert_hh_rlhf_to_dpo(sample: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert HH-RLHF format to DPO format.
+    
+    HH-RLHF format:
+        {"chosen": "Human: ...\n\nAssistant: ...", "rejected": "Human: ...\n\nAssistant: ..."}
+    
+    DPO format needs:
+        {"chosen": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}],
+         "rejected": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+    """
+    def parse_conversation(text: str) -> List[Dict[str, str]]:
+        """Parse HH-RLHF conversation string into message list."""
+        conversations = []
+        parts = text.split("\n\nAssistant:")
+        
+        if len(parts) < 2:
+            # Fallback: treat as single exchange
+            return [
+                {"role": "user", "content": text},
+                {"role": "assistant", "content": ""}
+            ]
+        
+        # Extract human part
+        human_part = parts[0].replace("Human:", "").strip()
+        conversations.append({"role": "user", "content": human_part})
+        
+        # Extract assistant part
+        assistant_part = parts[1].strip()
+        conversations.append({"role": "assistant", "content": assistant_part})
+        
+        return conversations
+    
+    return {
+        "chosen": parse_conversation(sample.get("chosen", "")),
+        "rejected": parse_conversation(sample.get("rejected", "")),
+        "text": sample.get("chosen", "")  # For compatibility
+    }
+
+
+def convert_dataset_format(dataset: Dataset, source: str) -> Dataset:
+    """
+    Apply format conversion based on dataset source.
+    
+    Args:
+        dataset: HuggingFace dataset
+        source: Dataset source identifier
+    
+    Returns:
+        Dataset with standardized format
+    """
+    # Map source to converter
+    converters = {
+        "tatsu-lab/alpaca": convert_alpaca_to_conversations,
+        "sahil2801/CodeAlpaca-20k": convert_code_alpaca_to_conversations,
+        "gsm8k": convert_gsm8k_to_conversations,
+        "Anthropic/hh-rlhf": convert_hh_rlhf_to_dpo,
+    }
+    
+    converter = converters.get(source)
+    
+    if converter:
+        print(f"  Converting {source} format...")
+        dataset = dataset.map(converter, remove_columns=dataset.column_names)
+    
+    return dataset

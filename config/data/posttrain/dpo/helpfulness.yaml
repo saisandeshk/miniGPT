@@ -1,0 +1,28 @@
+metadata:
+  phase: "dpo"
+  description: "Preference optimization for helpfulness"
+  total_tokens: 5_000_000
+  max_seq_length: 1024
+  version: "1.0"
+
+datasets:
+  # 100% - Anthropic HH-RLHF helpful preferences
+  - name: "hh_rlhf_helpful"
+    source: "Anthropic/hh-rlhf"
+    mix_ratio: 1.0
+    format: "huggingface"
+    text_field: "chosen"  # Has chosen and rejected fields
+    splits: ["train"]
+    max_samples: 50000
+    
+    # filters:
+    #   - type: "length"
+    #     min_length: 30
+    #     max_length: 2000
+      
+    #   - type: "quality"
+    #     min_score: 0.2
+
+validation:
+  ratio: 0.05
+  seed: 42

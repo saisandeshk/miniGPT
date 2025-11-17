@@ -1,0 +1,28 @@
+metadata:
+  phase: "sft"
+  description: "Math and reasoning instruction fine-tuning"
+  total_tokens: 6_000_000
+  max_seq_length: 1024
+  version: "1.0"
+
+datasets:
+  # 100% - Math problem solving
+  - name: "gsm8k_train"
+    source: "gsm8k"
+    mix_ratio: 1.0
+    format: "huggingface"
+    text_field: "question"  # Has question and answer
+    splits: ["train"]
+    max_samples: 7473  # Full training set
+    
+    filters:
+      - type: "length"
+        min_length: 20
+        max_length: 2000
+      
+      - type: "quality"
+        min_score: 0.3
+
+validation:
+  ratio: 0.05
+  seed: 42

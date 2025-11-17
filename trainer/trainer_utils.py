@@ -212,6 +212,55 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='model', save_d
     Logger(f'Trainable parameters of loaded Model: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} million')
     return model.to(device), tokenizer #type: ignore 
 
+def calculate_mfu(model_flops_per_token, tokens_per_sec, device):
+    """
+    Calculate Model FLOPs Utilization (MFU) - measures hardware efficiency.
+    
+    Args:
+        model_flops_per_token: FLOPs required to process one token
+        tokens_per_sec: Actual throughput in tokens/second
+        device: Device type ('cuda', 'cpu', etc.)
+    
+    Returns:
+        MFU as a percentage (0-100)
+    """
+    import torch
+
+    # Peak FLOPS for different GPUs (in FLOPs for bfloat16)
+    peak_flops = {
+        'A100': 312e12,       # A100 80GB
+        'H100': 989e12,       # H100 80GB
+        'V100': 125e12,       # V100 32GB
+        '4090': 165e12,       # RTX 4090
+        'RTX6000_BLACKWELL': 550e12,  # RTX PRO 6000 Blackwell Max-Q
+        'default': 125e12     # Conservative estimate
+    }
+
+    # Try to detect GPU type
+    if 'cuda' in str(device):
+        try:
+            gpu_name = torch.cuda.get_device_name(0)
+            if 'A100' in gpu_name:
+                peak = peak_flops['A100']
+            elif 'H100' in gpu_name:
+                peak = peak_flops['H100']
+            elif 'V100' in gpu_name:
+                peak = peak_flops['V100']
+            elif '4090' in gpu_name:
+                peak = peak_flops['4090']
+            elif '6000' in gpu_name and ('Blackwell' in gpu_name or 'PRO' in gpu_name):
+                peak = peak_flops['RTX6000_BLACKWELL']
+            else:
+                peak = peak_flops['default']
+        except:
+            peak = peak_flops['default']
+    else:
+        return 0.0  # MFU not applicable for CPU
+
+    achieved_flops = model_flops_per_token * tokens_per_sec
+    mfu = (achieved_flops / peak) * 100
+    return mfu
+
 
 class SkipBatchSampler(Sampler):
     """

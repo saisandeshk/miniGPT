@@ -1,0 +1,25 @@
+metadata:
+  phase: "rlaif"
+  description: "Prompts for GRPO training"
+  total_tokens: 2_000_000
+  max_seq_length: 512
+  version: "1.0"
+
+datasets:
+  # 100% - Diverse prompts
+  - name: "alpaca_prompts_grpo"
+    source: "tatsu-lab/alpaca"
+    mix_ratio: 1.0
+    format: "huggingface"
+    text_field: "instruction"
+    splits: ["train"]
+    max_samples: 30000
+    
+    filters:
+      - type: "length"
+        min_length: 10
+        max_length: 500
+
+validation:
+  ratio: 0.05
+  seed: 42

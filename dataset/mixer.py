@@ -141,6 +141,10 @@ class DatasetMixer:
             
             print(f"   Initial size: {len(raw_dataset)} samples")
             
+            # Apply format conversion if needed
+            from dataset.loader import convert_dataset_format
+            raw_dataset = convert_dataset_format(raw_dataset, ds_config.source)
+            
             # Apply filters
             if ds_config.filters:
                 print(f"   Applying {len(ds_config.filters)} filter(s)...")
@@ -241,12 +245,22 @@ class DatasetMixer:
             # Extract text samples
             for idx in tqdm(indices, desc=f"   Processing {ds_info['name']}", leave=False):
                 sample = dataset[idx % len(dataset)]
-                text = sample[text_field]
                 
-                all_samples.append({
-                    'text': text,
-                    'source': ds_info['name']  # Track source for analysis
-                })
+                # Check if this is a DPO dataset (has chosen/rejected fields)
+                if 'chosen' in sample and 'rejected' in sample:
+                    # DPO format: preserve chosen and rejected
+                    all_samples.append({
+                        'chosen': sample['chosen'],
+                        'rejected': sample['rejected'],
+                        'source': ds_info['name']
+                    })
+                else:
+                    # Regular format: extract text field
+                    text = sample[text_field]
+                    all_samples.append({
+                        'text': text,
+                        'source': ds_info['name']  # Track source for analysis
+                    })
         
         # Shuffle samples
         print(f"\n🔀 Shuffling {len(all_samples):,} samples...")

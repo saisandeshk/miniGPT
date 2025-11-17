@@ -24,7 +24,7 @@ from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import RLAIFDataset
 from trainer.trainer_utils import (
     Logger, is_main_process, lm_checkpoint, init_distributed_mode, 
-    setup_seed, SkipBatchSampler, init_model
+    setup_seed, SkipBatchSampler, init_model, calculate_mfu
 )
 
 # Suppress all warnings for cleaner output
@@ -228,6 +228,16 @@ def ppo_train_epoch(
     # Set models to training mode
     actor_model.train()
     critic_model.train()
+    
+    # Initialize tracking variables for metrics
+    import time
+    start_time = time.time()
+    total_tokens_seen = 0
+    grad_norm_actor = 0.0
+    grad_norm_critic = 0.0
+    
+    # Calculate model FLOPs for MFU calculation
+    model_flops_per_token = 6 * sum(p.numel() for p in actor_model.parameters() if p.requires_grad)
 
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch["prompt"]  # list[str], length B
@@ -328,12 +338,15 @@ def ppo_train_epoch(
         # Total loss with KL penalty and value coefficient
         loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
         loss.backward()
+        
+        # Track tokens seen (response tokens)
+        total_tokens_seen += (gen_out.shape[1] - enc.input_ids.shape[1]) * gen_out.shape[0]
 
         # ========== Optimization Step ==========
         if (step + 1) % args.accumulation_steps == 0:
             # Gradient clipping for both actor and critic
-            clip_grad_norm_(actor_model.parameters(), args.grad_clip)
-            clip_grad_norm_(critic_model.parameters(), args.grad_clip)
+            grad_norm_actor = clip_grad_norm_(actor_model.parameters(), args.grad_clip).item()
+            grad_norm_critic = clip_grad_norm_(critic_model.parameters(), args.grad_clip).item()
             
             # Optimizer steps
             actor_optimizer.step()
@@ -370,25 +383,68 @@ def ppo_train_epoch(
             kl_ref_val = kl_ref.item()
             avg_len_val = avg_len.item()
             actor_lr = actor_optimizer.param_groups[0]['lr']
+            critic_lr = critic_optimizer.param_groups[0]['lr']
+            
+            # Calculate throughput metrics
+            spend_time = time.time() - start_time
+            tokens_per_sec = total_tokens_seen / spend_time if spend_time > 0 else 0
+            samples_per_sec = (step * args.batch_size) / spend_time if spend_time > 0 else 0
+            steps_per_sec = step / spend_time if spend_time > 0 else 0
+            
+            # Calculate MFU (Model FLOPs Utilization)
+            mfu = calculate_mfu(model_flops_per_token, tokens_per_sec, args.device)
+            
+            # Global step across all epochs
+            global_step = epoch * iters + step
+            
+            # Estimated time remaining
+            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
 
-            # Log to wandb
+            # Log to wandb with comprehensive metrics
             if wandb is not None:
-                wandb.log({
-                    "actor_loss": actor_loss_val,
-                    "critic_loss": critic_loss_val,
-                    "reward": reward_val,
-                    "kl": kl_val,
-                    "kl_ref": kl_ref_val,
-                    "avg_response_len": avg_len_val,
-                    "actor_lr": actor_lr,
-                })
+                log_dict = {
+                    # PPO-specific metrics
+                    "train/actor_loss": actor_loss_val,
+                    "train/critic_loss": critic_loss_val,
+                    "train/reward": reward_val,
+                    "train/kl": kl_val,
+                    "train/kl_ref": kl_ref_val,
+                    "train/avg_response_len": avg_len_val,
+                    
+                    # Learning rates
+                    "train/actor_lr": actor_lr,
+                    "train/critic_lr": critic_lr,
+                    
+                    # Gradient norms
+                    "train/actor_grad_norm": grad_norm_actor,
+                    "train/critic_grad_norm": grad_norm_critic,
+                    
+                    # Progress tracking
+                    "train/epoch": epoch + (step / iters),
+                    "train/global_step": global_step,
+                    
+                    # Throughput metrics
+                    "train/tokens_per_second": tokens_per_sec,
+                    "train/samples_per_second": samples_per_sec,
+                    "train/steps_per_second": steps_per_sec,
+                    "train/num_tokens_generated": total_tokens_seen,
+                    
+                    # Efficiency metrics
+                    "train/mfu_percent": mfu,
+                    "train/eta_minutes": eta_min,
+                    
+                    # System metrics
+                    "system/epoch_time": spend_time / 60,  # in minutes
+                }
+                wandb.log(log_dict, step=global_step)
 
-            # Print log message
+            # Enhanced print log message
             Logger(
-                f"Epoch: {epoch+1}, Step: {step}/{iters}, "
-                f"Actor Loss: {actor_loss_val:.6f}, Critic Loss: {critic_loss_val:.6f}, "
-                f"Reward: {reward_val:.6f}, KL: {kl_val:.6f}, KL_ref: {kl_ref_val:.6f}, "
-                f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.2e}"
+                f"Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) "
+                f"actor_loss:{actor_loss_val:.6f} critic_loss:{critic_loss_val:.6f} "
+                f"reward:{reward_val:.4f} kl:{kl_val:.4f} "
+                f"grad_norm_actor:{grad_norm_actor:.4f} tokens/s:{tokens_per_sec:.0f} "
+                f"MFU:{mfu:.2f}% epoch_Time:{eta_min}min"
             )
 
         # ========== Old Actor Update ==========
@@ -414,7 +470,7 @@ def ppo_train_epoch(
             lm_checkpoint(
                 lm_config, weight=args.save_weight, model=actor_model, 
                 optimizer=actor_optimizer, epoch=epoch, step=step, wandb=wandb, 
-                save_dir='../checkpoints', scheduler=actor_scheduler, 
+                save_dir='checkpoints', scheduler=actor_scheduler, 
                 critic_model=critic_model, critic_optimizer=critic_optimizer, 
                 critic_scheduler=critic_scheduler
             )
@@ -445,7 +501,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind PPO (Proximal Policy Optimization)")
     
     # Directory and naming
-    parser.add_argument("--save_dir", type=str, default="../out", help="Model save directory")
+    parser.add_argument("--save_dir", type=str, default="out", help="Model save directory")
     parser.add_argument('--save_weight', default='ppo_actor', type=str, help="Prefix for saved weights")
     
     # Training hyperparameters
@@ -462,6 +518,8 @@ if __name__ == "__main__":
     # Logging and saving intervals
     parser.add_argument("--log_interval", type=int, default=1, help="Logging interval (steps)")
     parser.add_argument("--save_interval", type=int, default=10, help="Model saving interval (steps)")
+    parser.add_argument("--eval_interval", type=int, default=500, help="Evaluation interval (steps), 0 to disable")
+    parser.add_argument("--eval_batches", type=int, default=50, help="Number of batches to use for evaluation")
     
     # Model architecture
     parser.add_argument('--hidden_size', default=512, type=int, help="Hidden layer dimension")
@@ -478,15 +536,17 @@ if __name__ == "__main__":
     parser.add_argument("--kl_coef", type=float, default=0.02, help="KL divergence penalty coefficient")
     parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1], help='Model type (0=regular, 1=reasoning)')
     parser.add_argument("--update_old_actor_freq", type=int, default=4, help="Frequency to update old actor model")
-    parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward model path")
+    parser.add_argument("--reward_model_path", type=str, default="internlm/internlm2-1_8b-reward", help="Reward model path") # NOTE: Using the Hugginggface path
     
     # Data and resumption
-    parser.add_argument("--data_path", type=str, default="../dataset/rlaif-mini.jsonl", help="RLAIF training data path")
+    parser.add_argument("--data_path", type=str, default="dataset/rlhf_ppo_train.jsonl", help="RLAIF training data path")
+    parser.add_argument("--data_config", type=str, default=None, help="Path to dataset mixture YAML config")
+    parser.add_argument("--use_prepared", action="store_true", help="Use pre-prepared JSONL")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="Auto-detect and resume training (0=no, 1=yes)")
     
     # Experiment tracking
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-PPO", help="wandb project name")
+    parser.add_argument("--wandb_project", type=str, default="miniGPT-test-ppo", help="wandb project name")
     
     args = parser.parse_args()
 
@@ -511,7 +571,7 @@ if __name__ == "__main__":
     
     # Check for existing checkpoint if resuming
     ckp_data = lm_checkpoint(
-        lm_config, weight=args.save_weight, save_dir='../checkpoints'
+        lm_config, weight=args.save_weight, save_dir='checkpoints'
     ) if args.from_resume == 1 else None
     
     # ========== 3. Set up mixed precision training ==========
@@ -522,18 +582,28 @@ if __name__ == "__main__":
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
     # ========== 4. Configure wandb logging ==========
-    # Note: This uses swanlab as a wandb-compatible experiment tracker
     wandb = None
     if args.use_wandb and is_main_process():
-        import swanlab as wandb
+        import wandb as wandb_module
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-PPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
-        wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume) #type: ignore 
+        wandb_run_name = (
+            f"miniGPT-PPO-Epoch-{args.epochs}-BatchSize-{args.batch_size}-"
+            f"LearningRate-{args.learning_rate}"
+        )
+        wandb_run = wandb_module.init(
+            project=args.wandb_project,
+            name=wandb_run_name,
+            id=wandb_id,
+            resume=resume
+        )
+        wandb = wandb_module  # use module for logging
+        print(f"✅ Wandb initialized: {wandb_run.name} (ID: {wandb_run.id})")
     
     # ========== 5. Initialize models and data ==========
     # Base weight to initialize from (reasoning or full_sft)
-    base_weight = "reason" if args.reasoning == 1 else "full_sft"
+    # base_weight = "reason" if args.reasoning == 1 else "full_sft"
+    base_weight = "full_sft" # NOTE: Use the above when having an reasoning model
     
     # Actor model (policy being optimized)
     actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
@@ -563,6 +633,34 @@ if __name__ == "__main__":
     reward_tokenizer = AutoTokenizer.from_pretrained(args.reward_model_path, trust_remote_code=True)
     
     # Training dataset and optimizers
+    # Dataset preparation with mixer
+    if args.data_config:
+        from pathlib import Path
+        from dataset.mixer import DatasetMixer
+        
+        if is_main_process():
+            print(f"Using dataset config: {args.data_config}")
+        
+        mixer = DatasetMixer.from_yaml(args.data_config)
+        validation = mixer.validate_mixture()
+        
+        if not validation['is_valid']:
+            raise ValueError("Invalid mixture!")
+        
+        config_name = Path(args.data_config).stem
+        train_jsonl = f"dataset/{mixer.config.phase}_{config_name}_train.jsonl"
+        val_jsonl = f"dataset/{mixer.config.phase}_{config_name}_val.jsonl"
+        
+        if not args.use_prepared or not os.path.exists(train_jsonl):
+            if is_main_process():
+                mixer.prepare_dataset(train_jsonl, split="train")
+                mixer.prepare_dataset(val_jsonl, split="validation")
+            
+            if dist.is_initialized():
+                dist.barrier()
+        
+        args.data_path = train_jsonl
+    
     train_ds = RLAIFDataset(args.data_path, tokenizer, max_length=(args.max_seq_len + args.max_gen_len))
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     actor_optimizer = optim.AdamW(actor_model.parameters(), lr=args.learning_rate)

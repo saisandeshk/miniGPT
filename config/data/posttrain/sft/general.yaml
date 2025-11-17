@@ -1,0 +1,29 @@
+metadata:
+  phase: "sft"
+  description: "General instruction fine-tuning - diverse tasks"
+  total_tokens: 10_000_000  # 10M tokens
+  max_seq_length: 512
+  version: "1.0"
+
+datasets:
+  # 100% - Simple instruction following (Alpaca is small and fast)
+  - name: "alpaca_instructions"
+    source: "tatsu-lab/alpaca"
+    mix_ratio: 1.0
+    format: "huggingface"
+    text_field: "text"  # Will format from instruction/input/output
+    splits: ["train"]
+    max_samples: 50000  # Full dataset is 52K
+    
+    filters:
+      - type: "length"
+        min_length: 20
+        max_length: 2000
+      
+      - type: "quality"
+        min_score: 0.2
+
+validation:
+  ratio: 0.05
+  seed: 42
+  stratified: true

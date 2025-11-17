@@ -90,7 +90,6 @@ def main():
     print(f"      --batch_size 16\\")
     print(f"      --learning_rate 2e-4\\")
     print(f"      --use_wandb\\")
-    print(f"      --wandb_project "miniGPT-midtrain-experiment"\\")
     print()
 
 
